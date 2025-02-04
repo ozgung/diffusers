@@ -7,11 +7,12 @@ import PIL.Image
 import torch
 from transformers import T5EncoderModel, T5Tokenizer
 
-from ...loaders import LoraLoaderMixin
+from ...loaders import StableDiffusionLoraLoaderMixin
 from ...models import Kandinsky3UNet, VQModel
 from ...schedulers import DDPMScheduler
 from ...utils import (
     deprecate,
+    is_torch_xla_available,
     logging,
     replace_example_docstring,
 )
@@ -19,7 +20,15 @@ from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 
 
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
+
+    XLA_AVAILABLE = True
+else:
+    XLA_AVAILABLE = False
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
 
 EXAMPLE_DOC_STRING = """
     Examples:
@@ -62,7 +71,7 @@ def prepare_image(pil_image):
     return image
 
 
-class Kandinsky3Img2ImgPipeline(DiffusionPipeline, LoraLoaderMixin):
+class Kandinsky3Img2ImgPipeline(DiffusionPipeline, StableDiffusionLoraLoaderMixin):
     model_cpu_offload_seq = "text_encoder->movq->unet->movq"
     _callback_tensor_inputs = [
         "latents",
@@ -616,6 +625,9 @@ class Kandinsky3Img2ImgPipeline(DiffusionPipeline, LoraLoaderMixin):
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
 
             # post-processing
             if output_type not in ["pt", "np", "pil", "latent"]:

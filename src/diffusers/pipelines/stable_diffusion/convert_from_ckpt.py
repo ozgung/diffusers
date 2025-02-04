@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 The HuggingFace Inc. team.
+# Copyright 2025 The HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1370,6 +1370,8 @@ def download_from_original_stable_diffusion_ckpt(
 
     if "unet_config" in original_config["model"]["params"]:
         original_config["model"]["params"]["unet_config"]["params"]["in_channels"] = num_in_channels
+    elif "network_config" in original_config["model"]["params"]:
+        original_config["model"]["params"]["network_config"]["params"]["in_channels"] = num_in_channels
 
     if (
         "parameterization" in original_config["model"]["params"]

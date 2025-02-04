@@ -19,12 +19,20 @@ import torch
 from ...models import UNet2DModel
 from ...schedulers import CMStochasticIterativeScheduler
 from ...utils import (
+    is_torch_xla_available,
     logging,
     replace_example_docstring,
 )
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 
+
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
+
+    XLA_AVAILABLE = True
+else:
+    XLA_AVAILABLE = False
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -52,7 +60,7 @@ EXAMPLE_DOC_STRING = """
         >>> image.save("cd_imagenet64_l2_onestep_sample_penguin.png")
 
         >>> # Multistep sampling, class-conditional image generation
-        >>> # Timesteps can be explicitly specified; the particular timesteps below are from the original Github repo:
+        >>> # Timesteps can be explicitly specified; the particular timesteps below are from the original GitHub repo:
         >>> # https://github.com/openai/consistency_models/blob/main/scripts/launch.sh#L77
         >>> image = pipe(num_inference_steps=None, timesteps=[22, 0], class_labels=145).images[0]
         >>> image.save("cd_imagenet64_l2_multistep_sample_penguin.png")
@@ -262,6 +270,9 @@ class ConsistencyModelPipeline(DiffusionPipeline):
                 progress_bar.update()
                 if callback is not None and i % callback_steps == 0:
                     callback(i, t, sample)
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
 
         # 6. Post-process image sample
         image = self.postprocess_image(sample, output_type=output_type)

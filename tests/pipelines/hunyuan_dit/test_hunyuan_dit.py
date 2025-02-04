@@ -30,13 +30,18 @@ from diffusers import (
 from diffusers.utils.testing_utils import (
     enable_full_determinism,
     numpy_cosine_similarity_distance,
-    require_torch_gpu,
+    require_torch_accelerator,
     slow,
     torch_device,
 )
 
 from ..pipeline_params import TEXT_TO_IMAGE_BATCH_PARAMS, TEXT_TO_IMAGE_IMAGE_PARAMS, TEXT_TO_IMAGE_PARAMS
-from ..test_pipelines_common import PipelineTesterMixin, to_np
+from ..test_pipelines_common import (
+    PipelineTesterMixin,
+    check_qkv_fusion_matches_attn_procs_length,
+    check_qkv_fusion_processors_exist,
+    to_np,
+)
 
 
 enable_full_determinism()
@@ -50,6 +55,7 @@ class HunyuanDiTPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
     image_latents_params = TEXT_TO_IMAGE_IMAGE_PARAMS
 
     required_optional_params = PipelineTesterMixin.required_optional_params
+    test_layerwise_casting = True
 
     def get_dummy_components(self):
         torch.manual_seed(0)
@@ -261,6 +267,16 @@ class HunyuanDiTPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         original_image_slice = image[0, -3:, -3:, -1]
 
         pipe.transformer.fuse_qkv_projections()
+        # TODO (sayakpaul): will refactor this once `fuse_qkv_projections()` has been added
+        # to the pipeline level.
+        pipe.transformer.fuse_qkv_projections()
+        assert check_qkv_fusion_processors_exist(
+            pipe.transformer
+        ), "Something wrong with the fused attention processors. Expected all the attention processors to be fused."
+        assert check_qkv_fusion_matches_attn_procs_length(
+            pipe.transformer, pipe.transformer.original_attn_processors
+        ), "Something wrong with the attention processors concerning the fused QKV projections."
+
         inputs = self.get_dummy_inputs(device)
         inputs["return_dict"] = False
         image_fused = pipe(**inputs)[0]
@@ -284,7 +300,7 @@ class HunyuanDiTPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
 
 @slow
-@require_torch_gpu
+@require_torch_accelerator
 class HunyuanDiTPipelineIntegrationTests(unittest.TestCase):
     prompt = "一个宇航员在骑马"
 
@@ -304,7 +320,7 @@ class HunyuanDiTPipelineIntegrationTests(unittest.TestCase):
         pipe = HunyuanDiTPipeline.from_pretrained(
             "XCLiu/HunyuanDiT-0523", revision="refs/pr/2", torch_dtype=torch.float16
         )
-        pipe.enable_model_cpu_offload()
+        pipe.enable_model_cpu_offload(device=torch_device)
         prompt = self.prompt
 
         image = pipe(

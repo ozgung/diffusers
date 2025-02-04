@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 The HuggingFace Inc. team.
+# Copyright 2025 The HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,19 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-
 import importlib
 import os
 import re
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
+import requests
 import torch
-from huggingface_hub import model_info
-from huggingface_hub.utils import validate_hf_hub_args
+from huggingface_hub import DDUFEntry, ModelCard, model_info, snapshot_download
+from huggingface_hub.utils import OfflineModeIsEnabled, validate_hf_hub_args
 from packaging import version
+from requests.exceptions import HTTPError
 
 from .. import __version__
 from ..utils import (
@@ -33,18 +33,21 @@ from ..utils import (
     ONNX_WEIGHTS_NAME,
     SAFETENSORS_WEIGHTS_NAME,
     WEIGHTS_NAME,
+    deprecate,
     get_class_from_dynamic_module,
     is_accelerate_available,
     is_peft_available,
     is_transformers_available,
+    is_transformers_version,
     logging,
 )
 from ..utils.torch_utils import is_compiled_module
+from .transformers_loading_utils import _load_tokenizer_from_dduf, _load_transformers_model_from_dduf
 
 
 if is_transformers_available():
     import transformers
-    from transformers import PreTrainedModel
+    from transformers import PreTrainedModel, PreTrainedTokenizerBase
     from transformers.utils import FLAX_WEIGHTS_NAME as TRANSFORMERS_FLAX_WEIGHTS_NAME
     from transformers.utils import SAFE_WEIGHTS_NAME as TRANSFORMERS_SAFE_WEIGHTS_NAME
     from transformers.utils import WEIGHTS_NAME as TRANSFORMERS_WEIGHTS_NAME
@@ -89,49 +92,50 @@ for library in LOADABLE_CLASSES:
     ALL_IMPORTABLE_CLASSES.update(LOADABLE_CLASSES[library])
 
 
-def is_safetensors_compatible(filenames, variant=None, passed_components=None) -> bool:
+def is_safetensors_compatible(filenames, passed_components=None, folder_names=None) -> bool:
     """
     Checking for safetensors compatibility:
-    - By default, all models are saved with the default pytorch serialization, so we use the list of default pytorch
-      files to know which safetensors files are needed.
-    - The model is safetensors compatible only if there is a matching safetensors file for every default pytorch file.
+    - The model is safetensors compatible only if there is a safetensors file for each model component present in
+      filenames.
 
     Converting default pytorch serialized filenames to safetensors serialized filenames:
     - For models from the diffusers library, just replace the ".bin" extension with ".safetensors"
     - For models from the transformers library, the filename changes from "pytorch_model" to "model", and the ".bin"
       extension is replaced with ".safetensors"
     """
-    pt_filenames = []
-
-    sf_filenames = set()
-
     passed_components = passed_components or []
+    if folder_names is not None:
+        filenames = {f for f in filenames if os.path.split(f)[0] in folder_names}
 
+    # extract all components of the pipeline and their associated files
+    components = {}
     for filename in filenames:
-        _, extension = os.path.splitext(filename)
-
-        if len(filename.split("/")) == 2 and filename.split("/")[0] in passed_components:
+        if not len(filename.split("/")) == 2:
             continue
 
-        if extension == ".bin":
-            pt_filenames.append(os.path.normpath(filename))
-        elif extension == ".safetensors":
-            sf_filenames.add(os.path.normpath(filename))
+        component, component_filename = filename.split("/")
+        if component in passed_components:
+            continue
 
-    for filename in pt_filenames:
-        #  filename = 'foo/bar/baz.bam' -> path = 'foo/bar', filename = 'baz', extension = '.bam'
-        path, filename = os.path.split(filename)
-        filename, extension = os.path.splitext(filename)
+        components.setdefault(component, [])
+        components[component].append(component_filename)
 
-        if filename.startswith("pytorch_model"):
-            filename = filename.replace("pytorch_model", "model")
-        else:
-            filename = filename
+    # If there are no component folders check the main directory for safetensors files
+    if not components:
+        return any(".safetensors" in filename for filename in filenames)
 
-        expected_sf_filename = os.path.normpath(os.path.join(path, filename))
-        expected_sf_filename = f"{expected_sf_filename}.safetensors"
-        if expected_sf_filename not in sf_filenames:
-            logger.warning(f"{expected_sf_filename} not found")
+    # iterate over all files of a component
+    # check if safetensor files exist for that component
+    # if variant is provided check if the variant of the safetensors exists
+    for component, component_filenames in components.items():
+        matches = []
+        for component_filename in component_filenames:
+            filename, extension = os.path.splitext(component_filename)
+
+            match_exists = extension == ".safetensors"
+            matches.append(match_exists)
+
+        if not any(matches):
             return False
 
     return True
@@ -196,10 +200,31 @@ def variant_compatible_siblings(filenames, variant=None) -> Union[List[os.PathLi
             variant_filename = f"{filename.split('.')[0]}.{variant}.{filename.split('.')[1]}"
         return variant_filename
 
-    for f in non_variant_filenames:
-        variant_filename = convert_to_variant(f)
-        if variant_filename not in usable_filenames:
-            usable_filenames.add(f)
+    def find_component(filename):
+        if not len(filename.split("/")) == 2:
+            return
+        component = filename.split("/")[0]
+        return component
+
+    def has_sharded_variant(component, variant, variant_filenames):
+        # If component exists check for sharded variant index filename
+        # If component doesn't exist check main dir for sharded variant index filename
+        component = component + "/" if component else ""
+        variant_index_re = re.compile(
+            rf"{component}({'|'.join(weight_prefixes)})\.({'|'.join(weight_suffixs)})\.index\.{variant}\.json$"
+        )
+        return any(f for f in variant_filenames if variant_index_re.match(f) is not None)
+
+    for filename in non_variant_filenames:
+        if convert_to_variant(filename) in variant_filenames:
+            continue
+
+        component = find_component(filename)
+        # If a sharded variant exists skip adding to allowed patterns
+        if has_sharded_variant(component, variant, variant_filenames):
+            continue
+
+        usable_filenames.add(filename)
 
     return usable_filenames, variant_filenames
 
@@ -435,7 +460,6 @@ def _load_empty_model(
             return_unused_kwargs=True,
             return_commit_hash=True,
             force_download=kwargs.pop("force_download", False),
-            resume_download=kwargs.pop("resume_download", None),
             proxies=kwargs.pop("proxies", None),
             local_files_only=kwargs.pop("local_files_only", False),
             token=kwargs.pop("token", None),
@@ -454,7 +478,6 @@ def _load_empty_model(
             cached_folder,
             subfolder=name,
             force_download=kwargs.pop("force_download", False),
-            resume_download=kwargs.pop("resume_download", None),
             proxies=kwargs.pop("proxies", None),
             local_files_only=kwargs.pop("local_files_only", False),
             token=kwargs.pop("token", None),
@@ -544,7 +567,6 @@ def _get_final_device_map(device_map, pipeline_class, passed_class_obj, init_dic
                 torch_dtype=torch_dtype,
                 cached_folder=kwargs.get("cached_folder", None),
                 force_download=kwargs.get("force_download", None),
-                resume_download=kwargs.get("resume_download", None),
                 proxies=kwargs.get("proxies", None),
                 local_files_only=kwargs.get("local_files_only", None),
                 token=kwargs.get("token", None),
@@ -606,6 +628,8 @@ def load_sub_model(
     variant: str,
     low_cpu_mem_usage: bool,
     cached_folder: Union[str, os.PathLike],
+    use_safetensors: bool,
+    dduf_entries: Optional[Dict[str, DDUFEntry]],
 ):
     """Helper method to load the module `name` from `library_name` and `class_name`"""
 
@@ -642,7 +666,7 @@ def load_sub_model(
             f" any of the loading methods defined in {ALL_IMPORTABLE_CLASSES}."
         )
 
-    load_method = getattr(class_obj, load_method_name)
+    load_method = _get_load_method(class_obj, load_method_name, is_dduf=dduf_entries is not None)
 
     # add kwargs to loading method
     diffusers_module = importlib.import_module(__name__.split(".")[0])
@@ -675,6 +699,7 @@ def load_sub_model(
         loading_kwargs["offload_folder"] = offload_folder
         loading_kwargs["offload_state_dict"] = offload_state_dict
         loading_kwargs["variant"] = model_variants.pop(name, None)
+        loading_kwargs["use_safetensors"] = use_safetensors
 
         if from_flax:
             loading_kwargs["from_flax"] = True
@@ -699,7 +724,10 @@ def load_sub_model(
             loading_kwargs["low_cpu_mem_usage"] = False
 
     # check if the module is in a subdirectory
-    if os.path.isdir(os.path.join(cached_folder, name)):
+    if dduf_entries:
+        loading_kwargs["dduf_entries"] = dduf_entries
+        loaded_sub_model = load_method(name, **loading_kwargs)
+    elif os.path.isdir(os.path.join(cached_folder, name)):
         loaded_sub_model = load_method(os.path.join(cached_folder, name), **loading_kwargs)
     else:
         # else load from the root directory
@@ -722,6 +750,22 @@ def load_sub_model(
             dispatch_model(loaded_sub_model, device_map=device_map, force_hooks=True)
 
     return loaded_sub_model
+
+
+def _get_load_method(class_obj: object, load_method_name: str, is_dduf: bool) -> Callable:
+    """
+    Return the method to load the sub model.
+
+    In practice, this method will return the `"from_pretrained"` (or `load_method_name`) method of the class object
+    except if loading from a DDUF checkpoint. In that case, transformers models and tokenizers have a specific loading
+    method that we need to use.
+    """
+    if is_dduf:
+        if issubclass(class_obj, PreTrainedTokenizerBase):
+            return lambda *args, **kwargs: _load_tokenizer_from_dduf(class_obj, *args, **kwargs)
+        if issubclass(class_obj, PreTrainedModel):
+            return lambda *args, **kwargs: _load_transformers_model_from_dduf(class_obj, *args, **kwargs)
+    return getattr(class_obj, load_method_name)
 
 
 def _fetch_class_library_tuple(module):
@@ -752,3 +796,264 @@ def _fetch_class_library_tuple(module):
     class_name = not_compiled_module.__class__.__name__
 
     return (library, class_name)
+
+
+def _identify_model_variants(folder: str, variant: str, config: dict) -> dict:
+    model_variants = {}
+    if variant is not None:
+        for sub_folder in os.listdir(folder):
+            folder_path = os.path.join(folder, sub_folder)
+            is_folder = os.path.isdir(folder_path) and sub_folder in config
+            variant_exists = is_folder and any(p.split(".")[1].startswith(variant) for p in os.listdir(folder_path))
+            if variant_exists:
+                model_variants[sub_folder] = variant
+    return model_variants
+
+
+def _resolve_custom_pipeline_and_cls(folder, config, custom_pipeline):
+    custom_class_name = None
+    if os.path.isfile(os.path.join(folder, f"{custom_pipeline}.py")):
+        custom_pipeline = os.path.join(folder, f"{custom_pipeline}.py")
+    elif isinstance(config["_class_name"], (list, tuple)) and os.path.isfile(
+        os.path.join(folder, f"{config['_class_name'][0]}.py")
+    ):
+        custom_pipeline = os.path.join(folder, f"{config['_class_name'][0]}.py")
+        custom_class_name = config["_class_name"][1]
+
+    return custom_pipeline, custom_class_name
+
+
+def _maybe_raise_warning_for_inpainting(pipeline_class, pretrained_model_name_or_path: str, config: dict):
+    if pipeline_class.__name__ == "StableDiffusionInpaintPipeline" and version.parse(
+        version.parse(config["_diffusers_version"]).base_version
+    ) <= version.parse("0.5.1"):
+        from diffusers import StableDiffusionInpaintPipeline, StableDiffusionInpaintPipelineLegacy
+
+        pipeline_class = StableDiffusionInpaintPipelineLegacy
+
+        deprecation_message = (
+            "You are using a legacy checkpoint for inpainting with Stable Diffusion, therefore we are loading the"
+            f" {StableDiffusionInpaintPipelineLegacy} class instead of {StableDiffusionInpaintPipeline}. For"
+            " better inpainting results, we strongly suggest using Stable Diffusion's official inpainting"
+            " checkpoint: https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-inpainting instead or adapting your"
+            f" checkpoint {pretrained_model_name_or_path} to the format of"
+            " https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-inpainting. Note that we do not actively maintain"
+            " the {StableDiffusionInpaintPipelineLegacy} class and will likely remove it in version 1.0.0."
+        )
+        deprecate("StableDiffusionInpaintPipelineLegacy", "1.0.0", deprecation_message, standard_warn=False)
+
+
+def _update_init_kwargs_with_connected_pipeline(
+    init_kwargs: dict, passed_pipe_kwargs: dict, passed_class_objs: dict, folder: str, **pipeline_loading_kwargs
+) -> dict:
+    from .pipeline_utils import DiffusionPipeline
+
+    modelcard = ModelCard.load(os.path.join(folder, "README.md"))
+    connected_pipes = {prefix: getattr(modelcard.data, prefix, [None])[0] for prefix in CONNECTED_PIPES_KEYS}
+
+    # We don't scheduler argument to match the existing logic:
+    # https://github.com/huggingface/diffusers/blob/867e0c919e1aa7ef8b03c8eb1460f4f875a683ae/src/diffusers/pipelines/pipeline_utils.py#L906C13-L925C14
+    pipeline_loading_kwargs_cp = pipeline_loading_kwargs.copy()
+    if pipeline_loading_kwargs_cp is not None and len(pipeline_loading_kwargs_cp) >= 1:
+        for k in pipeline_loading_kwargs:
+            if "scheduler" in k:
+                _ = pipeline_loading_kwargs_cp.pop(k)
+
+    def get_connected_passed_kwargs(prefix):
+        connected_passed_class_obj = {
+            k.replace(f"{prefix}_", ""): w for k, w in passed_class_objs.items() if k.split("_")[0] == prefix
+        }
+        connected_passed_pipe_kwargs = {
+            k.replace(f"{prefix}_", ""): w for k, w in passed_pipe_kwargs.items() if k.split("_")[0] == prefix
+        }
+
+        connected_passed_kwargs = {**connected_passed_class_obj, **connected_passed_pipe_kwargs}
+        return connected_passed_kwargs
+
+    connected_pipes = {
+        prefix: DiffusionPipeline.from_pretrained(
+            repo_id, **pipeline_loading_kwargs_cp, **get_connected_passed_kwargs(prefix)
+        )
+        for prefix, repo_id in connected_pipes.items()
+        if repo_id is not None
+    }
+
+    for prefix, connected_pipe in connected_pipes.items():
+        # add connected pipes to `init_kwargs` with <prefix>_<component_name>, e.g. "prior_text_encoder"
+        init_kwargs.update(
+            {"_".join([prefix, name]): component for name, component in connected_pipe.components.items()}
+        )
+
+    return init_kwargs
+
+
+def _get_custom_components_and_folders(
+    pretrained_model_name: str,
+    config_dict: Dict[str, Any],
+    filenames: Optional[List[str]] = None,
+    variant_filenames: Optional[List[str]] = None,
+    variant: Optional[str] = None,
+):
+    config_dict = config_dict.copy()
+
+    # retrieve all folder_names that contain relevant files
+    folder_names = [k for k, v in config_dict.items() if isinstance(v, list) and k != "_class_name"]
+
+    diffusers_module = importlib.import_module(__name__.split(".")[0])
+    pipelines = getattr(diffusers_module, "pipelines")
+
+    # optionally create a custom component <> custom file mapping
+    custom_components = {}
+    for component in folder_names:
+        module_candidate = config_dict[component][0]
+
+        if module_candidate is None or not isinstance(module_candidate, str):
+            continue
+
+        # We compute candidate file path on the Hub. Do not use `os.path.join`.
+        candidate_file = f"{component}/{module_candidate}.py"
+
+        if candidate_file in filenames:
+            custom_components[component] = module_candidate
+        elif module_candidate not in LOADABLE_CLASSES and not hasattr(pipelines, module_candidate):
+            raise ValueError(
+                f"{candidate_file} as defined in `model_index.json` does not exist in {pretrained_model_name} and is not a module in 'diffusers/pipelines'."
+            )
+
+    if len(variant_filenames) == 0 and variant is not None:
+        error_message = f"You are trying to load the model files of the `variant={variant}`, but no such modeling files are available."
+        raise ValueError(error_message)
+
+    return custom_components, folder_names
+
+
+def _get_ignore_patterns(
+    passed_components,
+    model_folder_names: List[str],
+    model_filenames: List[str],
+    variant_filenames: List[str],
+    use_safetensors: bool,
+    from_flax: bool,
+    allow_pickle: bool,
+    use_onnx: bool,
+    is_onnx: bool,
+    variant: Optional[str] = None,
+) -> List[str]:
+    if (
+        use_safetensors
+        and not allow_pickle
+        and not is_safetensors_compatible(
+            model_filenames, passed_components=passed_components, folder_names=model_folder_names
+        )
+    ):
+        raise EnvironmentError(
+            f"Could not find the necessary `safetensors` weights in {model_filenames} (variant={variant})"
+        )
+
+    if from_flax:
+        ignore_patterns = ["*.bin", "*.safetensors", "*.onnx", "*.pb"]
+
+    elif use_safetensors and is_safetensors_compatible(
+        model_filenames, passed_components=passed_components, folder_names=model_folder_names
+    ):
+        ignore_patterns = ["*.bin", "*.msgpack"]
+
+        use_onnx = use_onnx if use_onnx is not None else is_onnx
+        if not use_onnx:
+            ignore_patterns += ["*.onnx", "*.pb"]
+
+        safetensors_variant_filenames = {f for f in variant_filenames if f.endswith(".safetensors")}
+        safetensors_model_filenames = {f for f in model_filenames if f.endswith(".safetensors")}
+        if len(safetensors_variant_filenames) > 0 and safetensors_model_filenames != safetensors_variant_filenames:
+            logger.warning(
+                f"\nA mixture of {variant} and non-{variant} filenames will be loaded.\nLoaded {variant} filenames:\n"
+                f"[{', '.join(safetensors_variant_filenames)}]\nLoaded non-{variant} filenames:\n"
+                f"[{', '.join(safetensors_model_filenames - safetensors_variant_filenames)}\nIf this behavior is not "
+                f"expected, please check your folder structure."
+            )
+
+    else:
+        ignore_patterns = ["*.safetensors", "*.msgpack"]
+
+        use_onnx = use_onnx if use_onnx is not None else is_onnx
+        if not use_onnx:
+            ignore_patterns += ["*.onnx", "*.pb"]
+
+        bin_variant_filenames = {f for f in variant_filenames if f.endswith(".bin")}
+        bin_model_filenames = {f for f in model_filenames if f.endswith(".bin")}
+        if len(bin_variant_filenames) > 0 and bin_model_filenames != bin_variant_filenames:
+            logger.warning(
+                f"\nA mixture of {variant} and non-{variant} filenames will be loaded.\nLoaded {variant} filenames:\n"
+                f"[{', '.join(bin_variant_filenames)}]\nLoaded non-{variant} filenames:\n"
+                f"[{', '.join(bin_model_filenames - bin_variant_filenames)}\nIf this behavior is not expected, please check "
+                f"your folder structure."
+            )
+
+    return ignore_patterns
+
+
+def _download_dduf_file(
+    pretrained_model_name: str,
+    dduf_file: str,
+    pipeline_class_name: str,
+    cache_dir: str,
+    proxies: str,
+    local_files_only: bool,
+    token: str,
+    revision: str,
+):
+    model_info_call_error = None
+    if not local_files_only:
+        try:
+            info = model_info(pretrained_model_name, token=token, revision=revision)
+        except (HTTPError, OfflineModeIsEnabled, requests.ConnectionError) as e:
+            logger.warning(f"Couldn't connect to the Hub: {e}.\nWill try to load from local cache.")
+            local_files_only = True
+            model_info_call_error = e  # save error to reraise it if model is not cached locally
+
+    if (
+        not local_files_only
+        and dduf_file is not None
+        and dduf_file not in (sibling.rfilename for sibling in info.siblings)
+    ):
+        raise ValueError(f"Requested {dduf_file} file is not available in {pretrained_model_name}.")
+
+    try:
+        user_agent = {"pipeline_class": pipeline_class_name, "dduf": True}
+        cached_folder = snapshot_download(
+            pretrained_model_name,
+            cache_dir=cache_dir,
+            proxies=proxies,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            allow_patterns=[dduf_file],
+            user_agent=user_agent,
+        )
+        return cached_folder
+    except FileNotFoundError:
+        # Means we tried to load pipeline with `local_files_only=True` but the files have not been found in local cache.
+        # This can happen in two cases:
+        # 1. If the user passed `local_files_only=True`                    => we raise the error directly
+        # 2. If we forced `local_files_only=True` when `model_info` failed => we raise the initial error
+        if model_info_call_error is None:
+            # 1. user passed `local_files_only=True`
+            raise
+        else:
+            # 2. we forced `local_files_only=True` when `model_info` failed
+            raise EnvironmentError(
+                f"Cannot load model {pretrained_model_name}: model is not cached locally and an error occurred"
+                " while trying to fetch metadata from the Hub. Please check out the root cause in the stacktrace"
+                " above."
+            ) from model_info_call_error
+
+
+def _maybe_raise_error_for_incorrect_transformers(config_dict):
+    has_transformers_component = False
+    for k in config_dict:
+        if isinstance(config_dict[k], list):
+            has_transformers_component = config_dict[k][0] == "transformers"
+            if has_transformers_component:
+                break
+    if has_transformers_component and not is_transformers_version(">", "4.47.1"):
+        raise ValueError("Please upgrade your `transformers` installation to the latest version to use DDUF.")

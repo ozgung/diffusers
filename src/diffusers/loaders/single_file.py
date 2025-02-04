@@ -23,6 +23,7 @@ from packaging import version
 from ..utils import deprecate, is_transformers_available, logging
 from .single_file_utils import (
     SingleFileComponentError,
+    _is_legacy_scheduler_kwargs,
     _is_model_weights_in_cached_folder,
     _legacy_load_clip_tokenizer,
     _legacy_load_safety_checker,
@@ -42,7 +43,6 @@ logger = logging.get_logger(__name__)
 # Legacy behaviour. `from_single_file` does not load the safety checker unless explicitly provided
 SINGLE_FILE_OPTIONAL_COMPONENTS = ["safety_checker"]
 
-
 if is_transformers_available():
     import transformers
     from transformers import PreTrainedModel, PreTrainedTokenizer
@@ -60,6 +60,7 @@ def load_single_file_sub_model(
     local_files_only=False,
     torch_dtype=None,
     is_legacy_loading=False,
+    disable_mmap=False,
     **kwargs,
 ):
     if is_pipeline_module:
@@ -106,6 +107,7 @@ def load_single_file_sub_model(
             subfolder=name,
             torch_dtype=torch_dtype,
             local_files_only=local_files_only,
+            disable_mmap=disable_mmap,
             **kwargs,
         )
 
@@ -135,7 +137,7 @@ def load_single_file_sub_model(
             class_obj, checkpoint=checkpoint, config=cached_model_config_path, local_files_only=local_files_only
         )
 
-    elif is_diffusers_scheduler and is_legacy_loading:
+    elif is_diffusers_scheduler and (is_legacy_loading or _is_legacy_scheduler_kwargs(kwargs)):
         loaded_sub_model = _legacy_load_scheduler(
             class_obj, checkpoint=checkpoint, component_name=name, original_config=original_config, **kwargs
         )
@@ -242,7 +244,6 @@ def _download_diffusers_model_config_from_hub(
     revision,
     proxies,
     force_download=None,
-    resume_download=None,
     local_files_only=None,
     token=None,
 ):
@@ -253,7 +254,6 @@ def _download_diffusers_model_config_from_hub(
         revision=revision,
         proxies=proxies,
         force_download=force_download,
-        resume_download=resume_download,
         local_files_only=local_files_only,
         token=token,
         allow_patterns=allow_patterns,
@@ -288,9 +288,7 @@ class FromSingleFileMixin:
             cache_dir (`Union[str, os.PathLike]`, *optional*):
                 Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
                 is not used.
-            resume_download:
-                Deprecated and ignored. All downloads are now resumed by default when possible. Will be removed in v1
-                of Diffusers.
+
             proxies (`Dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
@@ -312,6 +310,9 @@ class FromSingleFileMixin:
                       hosted on the Hub.
                     - A path to a *directory* (for example `./my_pipeline_directory/`) containing the pipeline
                       component configs in Diffusers format.
+            disable_mmap ('bool', *optional*, defaults to 'False'):
+                Whether to disable mmap when loading a Safetensors model. This option can perform better when the model
+                is on a network mount or hard drive.
             kwargs (remaining dictionary of keyword arguments, *optional*):
                 Can be used to overwrite load and saveable variables (the pipeline components of the specific pipeline
                 class). The overwritten components are passed directly to the pipelines `__init__` method. See example
@@ -333,7 +334,7 @@ class FromSingleFileMixin:
 
         >>> # Enable float16 and move to GPU
         >>> pipeline = StableDiffusionPipeline.from_single_file(
-        ...     "https://huggingface.co/runwayml/stable-diffusion-v1-5/blob/main/v1-5-pruned-emaonly.ckpt",
+        ...     "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/blob/main/v1-5-pruned-emaonly.ckpt",
         ...     torch_dtype=torch.float16,
         ... )
         >>> pipeline.to("cuda")
@@ -352,7 +353,6 @@ class FromSingleFileMixin:
             deprecate("original_config_file", "1.0.0", deprecation_message)
             original_config = original_config_file
 
-        resume_download = kwargs.pop("resume_download", None)
         force_download = kwargs.pop("force_download", False)
         proxies = kwargs.pop("proxies", None)
         token = kwargs.pop("token", None)
@@ -360,6 +360,7 @@ class FromSingleFileMixin:
         local_files_only = kwargs.pop("local_files_only", False)
         revision = kwargs.pop("revision", None)
         torch_dtype = kwargs.pop("torch_dtype", None)
+        disable_mmap = kwargs.pop("disable_mmap", False)
 
         is_legacy_loading = False
 
@@ -382,13 +383,13 @@ class FromSingleFileMixin:
 
         checkpoint = load_single_file_checkpoint(
             pretrained_model_link_or_path,
-            resume_download=resume_download,
             force_download=force_download,
             proxies=proxies,
             token=token,
             cache_dir=cache_dir,
             local_files_only=local_files_only,
             revision=revision,
+            disable_mmap=disable_mmap,
         )
 
         if config is None:
@@ -412,7 +413,6 @@ class FromSingleFileMixin:
                     revision=revision,
                     proxies=proxies,
                     force_download=force_download,
-                    resume_download=resume_download,
                     local_files_only=local_files_only,
                     token=token,
                 )
@@ -435,7 +435,6 @@ class FromSingleFileMixin:
                         revision=revision,
                         proxies=proxies,
                         force_download=force_download,
-                        resume_download=resume_download,
                         local_files_only=False,
                         token=token,
                     )
@@ -512,6 +511,7 @@ class FromSingleFileMixin:
                         original_config=original_config,
                         local_files_only=local_files_only,
                         is_legacy_loading=is_legacy_loading,
+                        disable_mmap=disable_mmap,
                         **kwargs,
                     )
                 except SingleFileComponentError as e:
@@ -554,8 +554,5 @@ class FromSingleFileMixin:
             init_kwargs.update(safety_checker_components)
 
         pipe = pipeline_class(**init_kwargs)
-
-        if torch_dtype is not None:
-            pipe.to(dtype=torch_dtype)
 
         return pipe

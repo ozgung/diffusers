@@ -36,11 +36,11 @@ from diffusers import (
 from diffusers.models.unets import I2VGenXLUNet
 from diffusers.utils import is_xformers_available, load_image
 from diffusers.utils.testing_utils import (
+    backend_empty_cache,
     enable_full_determinism,
     floats_tensor,
     numpy_cosine_similarity_distance,
-    print_tensor_test,
-    require_torch_gpu,
+    require_torch_accelerator,
     skip_mps,
     slow,
     torch_device,
@@ -59,6 +59,9 @@ class I2VGenXLPipelineFastTests(SDFunctionTesterMixin, PipelineTesterMixin, unit
     batch_params = frozenset(["prompt", "negative_prompt", "image", "generator"])
     # No `output_type`.
     required_optional_params = frozenset(["num_inference_steps", "generator", "latents", "return_dict"])
+
+    supports_dduf = False
+    test_layerwise_casting = True
 
     def get_dummy_components(self):
         torch.manual_seed(0)
@@ -227,23 +230,23 @@ class I2VGenXLPipelineFastTests(SDFunctionTesterMixin, PipelineTesterMixin, unit
 
 
 @slow
-@require_torch_gpu
+@require_torch_accelerator
 class I2VGenXLPipelineSlowTests(unittest.TestCase):
     def setUp(self):
         # clean up the VRAM before each test
         super().setUp()
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def tearDown(self):
         # clean up the VRAM after each test
         super().tearDown()
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def test_i2vgen_xl(self):
         pipe = I2VGenXLPipeline.from_pretrained("ali-vilab/i2vgen-xl", torch_dtype=torch.float16, variant="fp16")
-        pipe.enable_model_cpu_offload()
+        pipe.enable_model_cpu_offload(device=torch_device)
         pipe.set_progress_bar_config(disable=None)
         image = load_image(
             "https://huggingface.co/datasets/hf-internal-testing/diffusers-images/resolve/main/pix2pix/cat_6.png?download=true"
@@ -265,6 +268,5 @@ class I2VGenXLPipelineSlowTests(unittest.TestCase):
         assert image.shape == (num_frames, 704, 1280, 3)
 
         image_slice = image[0, -3:, -3:, -1]
-        print_tensor_test(image_slice.flatten())
         expected_slice = np.array([0.5482, 0.6244, 0.6274, 0.4584, 0.5935, 0.5937, 0.4579, 0.5767, 0.5892])
         assert numpy_cosine_similarity_distance(image_slice.flatten(), expected_slice.flatten()) < 1e-3

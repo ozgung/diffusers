@@ -45,12 +45,12 @@ from diffusers import (
 from diffusers.utils.testing_utils import (
     CaptureLogger,
     enable_full_determinism,
+    is_torch_compile,
     load_image,
     load_numpy,
     nightly,
     numpy_cosine_similarity_distance,
     require_accelerate_version_greater,
-    require_python39_or_higher,
     require_torch_2,
     require_torch_gpu,
     require_torch_multi_gpu,
@@ -123,6 +123,7 @@ class StableDiffusionPipelineFastTests(
     image_params = TEXT_TO_IMAGE_IMAGE_PARAMS
     image_latents_params = TEXT_TO_IMAGE_IMAGE_PARAMS
     callback_cfg_params = TEXT_TO_IMAGE_CALLBACK_CFG_PARAMS
+    test_layerwise_casting = True
 
     def get_dummy_components(self, time_cond_proj_dim=None):
         cross_attention_dim = 8
@@ -840,6 +841,14 @@ class StableDiffusionPipelineFastTests(
         # they should be the same
         assert torch.allclose(intermediate_latent, output_interrupted, atol=1e-4)
 
+    def test_pipeline_accept_tuple_type_unet_sample_size(self):
+        # the purpose of this test is to see whether the pipeline would accept a unet with the tuple-typed sample size
+        sd_repo_id = "stable-diffusion-v1-5/stable-diffusion-v1-5"
+        sample_size = [60, 80]
+        customised_unet = UNet2DConditionModel(sample_size=sample_size)
+        pipe = StableDiffusionPipeline.from_pretrained(sd_repo_id, unet=customised_unet)
+        assert pipe.unet.config.sample_size == sample_size
+
 
 @slow
 @require_torch_gpu
@@ -1013,7 +1022,7 @@ class StableDiffusionPipelineSlowTests(unittest.TestCase):
         torch.cuda.reset_peak_memory_stats()
         model_id = "CompVis/stable-diffusion-v1-4"
         pipe = StableDiffusionPipeline.from_pretrained(
-            model_id, revision="fp16", torch_dtype=torch.float16, safety_checker=None
+            model_id, variant="fp16", torch_dtype=torch.float16, safety_checker=None
         )
         pipe.set_progress_bar_config(disable=None)
         pipe.enable_attention_slicing()
@@ -1282,7 +1291,7 @@ class StableDiffusionPipelineSlowTests(unittest.TestCase):
         max_diff = np.abs(expected_image - image).max()
         assert max_diff < 8e-1
 
-    @require_python39_or_higher
+    @is_torch_compile
     @require_torch_2
     def test_stable_diffusion_compile(self):
         seed = 0
@@ -1332,7 +1341,7 @@ class StableDiffusionPipelineCkptTests(unittest.TestCase):
 
     def test_download_from_hub(self):
         ckpt_paths = [
-            "https://huggingface.co/runwayml/stable-diffusion-v1-5/blob/main/v1-5-pruned-emaonly.safetensors",
+            "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/blob/main/v1-5-pruned-emaonly.safetensors",
             "https://huggingface.co/WarriorMama777/OrangeMixs/blob/main/Models/AbyssOrangeMix/AbyssOrangeMix.safetensors",
         ]
 
@@ -1346,8 +1355,10 @@ class StableDiffusionPipelineCkptTests(unittest.TestCase):
         assert image_out.shape == (512, 512, 3)
 
     def test_download_local(self):
-        ckpt_filename = hf_hub_download("runwayml/stable-diffusion-v1-5", filename="v1-5-pruned-emaonly.safetensors")
-        config_filename = hf_hub_download("runwayml/stable-diffusion-v1-5", filename="v1-inference.yaml")
+        ckpt_filename = hf_hub_download(
+            "stable-diffusion-v1-5/stable-diffusion-v1-5", filename="v1-5-pruned-emaonly.safetensors"
+        )
+        config_filename = hf_hub_download("stable-diffusion-v1-5/stable-diffusion-v1-5", filename="v1-inference.yaml")
 
         pipe = StableDiffusionPipeline.from_single_file(
             ckpt_filename, config_files={"v1": config_filename}, torch_dtype=torch.float16
@@ -1402,7 +1413,9 @@ class StableDiffusionPipelineNightlyTests(unittest.TestCase):
         assert max_diff < 1e-3
 
     def test_stable_diffusion_1_5_pndm(self):
-        sd_pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5").to(torch_device)
+        sd_pipe = StableDiffusionPipeline.from_pretrained("stable-diffusion-v1-5/stable-diffusion-v1-5").to(
+            torch_device
+        )
         sd_pipe.set_progress_bar_config(disable=None)
 
         inputs = self.get_inputs(torch_device)
@@ -1484,7 +1497,7 @@ class StableDiffusionPipelineDeviceMapTests(unittest.TestCase):
 
     def get_pipeline_output_without_device_map(self):
         sd_pipe = StableDiffusionPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16
+            "stable-diffusion-v1-5/stable-diffusion-v1-5", torch_dtype=torch.float16
         ).to(torch_device)
         sd_pipe.set_progress_bar_config(disable=True)
         inputs = self.get_inputs()
@@ -1498,7 +1511,7 @@ class StableDiffusionPipelineDeviceMapTests(unittest.TestCase):
         no_device_map_image = self.get_pipeline_output_without_device_map()
 
         sd_pipe_with_device_map = StableDiffusionPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5", device_map="balanced", torch_dtype=torch.float16
+            "stable-diffusion-v1-5/stable-diffusion-v1-5", device_map="balanced", torch_dtype=torch.float16
         )
         sd_pipe_with_device_map.set_progress_bar_config(disable=True)
         inputs = self.get_inputs()
@@ -1509,7 +1522,7 @@ class StableDiffusionPipelineDeviceMapTests(unittest.TestCase):
 
     def test_components_put_in_right_devices(self):
         sd_pipe_with_device_map = StableDiffusionPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5", device_map="balanced", torch_dtype=torch.float16
+            "stable-diffusion-v1-5/stable-diffusion-v1-5", device_map="balanced", torch_dtype=torch.float16
         )
 
         assert len(set(sd_pipe_with_device_map.hf_device_map.values())) >= 2
@@ -1518,7 +1531,7 @@ class StableDiffusionPipelineDeviceMapTests(unittest.TestCase):
         no_device_map_image = self.get_pipeline_output_without_device_map()
 
         sd_pipe_with_device_map = StableDiffusionPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5",
+            "stable-diffusion-v1-5/stable-diffusion-v1-5",
             device_map="balanced",
             max_memory={0: "1GB", 1: "1GB"},
             torch_dtype=torch.float16,
@@ -1532,7 +1545,7 @@ class StableDiffusionPipelineDeviceMapTests(unittest.TestCase):
 
     def test_reset_device_map(self):
         sd_pipe_with_device_map = StableDiffusionPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5", device_map="balanced", torch_dtype=torch.float16
+            "stable-diffusion-v1-5/stable-diffusion-v1-5", device_map="balanced", torch_dtype=torch.float16
         )
         sd_pipe_with_device_map.reset_device_map()
 
@@ -1544,7 +1557,7 @@ class StableDiffusionPipelineDeviceMapTests(unittest.TestCase):
 
     def test_reset_device_map_to(self):
         sd_pipe_with_device_map = StableDiffusionPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5", device_map="balanced", torch_dtype=torch.float16
+            "stable-diffusion-v1-5/stable-diffusion-v1-5", device_map="balanced", torch_dtype=torch.float16
         )
         sd_pipe_with_device_map.reset_device_map()
 
@@ -1556,7 +1569,7 @@ class StableDiffusionPipelineDeviceMapTests(unittest.TestCase):
 
     def test_reset_device_map_enable_model_cpu_offload(self):
         sd_pipe_with_device_map = StableDiffusionPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5", device_map="balanced", torch_dtype=torch.float16
+            "stable-diffusion-v1-5/stable-diffusion-v1-5", device_map="balanced", torch_dtype=torch.float16
         )
         sd_pipe_with_device_map.reset_device_map()
 
@@ -1568,7 +1581,7 @@ class StableDiffusionPipelineDeviceMapTests(unittest.TestCase):
 
     def test_reset_device_map_enable_sequential_cpu_offload(self):
         sd_pipe_with_device_map = StableDiffusionPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5", device_map="balanced", torch_dtype=torch.float16
+            "stable-diffusion-v1-5/stable-diffusion-v1-5", device_map="balanced", torch_dtype=torch.float16
         )
         sd_pipe_with_device_map.reset_device_map()
 

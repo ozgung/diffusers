@@ -1,4 +1,5 @@
 import tempfile
+import unittest
 
 import torch
 
@@ -65,6 +66,7 @@ class DPMSolverSinglestepSchedulerTest(SchedulerCommonTest):
 
                 assert torch.sum(torch.abs(output - new_output)) < 1e-5, "Scheduler outputs are not identical"
 
+    @unittest.skip("Test not supported.")
     def test_from_save_pretrained(self):
         pass
 
@@ -194,16 +196,20 @@ class DPMSolverSinglestepSchedulerTest(SchedulerCommonTest):
             self.check_over_configs(prediction_type=prediction_type)
 
     def test_solver_order_and_type(self):
-        for algorithm_type in ["dpmsolver", "dpmsolver++"]:
+        for algorithm_type in ["dpmsolver", "dpmsolver++", "sde-dpmsolver++"]:
             for solver_type in ["midpoint", "heun"]:
                 for order in [1, 2, 3]:
                     for prediction_type in ["epsilon", "sample"]:
-                        self.check_over_configs(
-                            solver_order=order,
-                            solver_type=solver_type,
-                            prediction_type=prediction_type,
-                            algorithm_type=algorithm_type,
-                        )
+                        if algorithm_type == "sde-dpmsolver++":
+                            if order == 3:
+                                continue
+                        else:
+                            self.check_over_configs(
+                                solver_order=order,
+                                solver_type=solver_type,
+                                prediction_type=prediction_type,
+                                algorithm_type=algorithm_type,
+                            )
                         sample = self.full_loop(
                             solver_order=order,
                             solver_type=solver_type,
@@ -342,3 +348,9 @@ class DPMSolverSinglestepSchedulerTest(SchedulerCommonTest):
                     assert (
                         torch.sum(torch.abs(sample - sample_custom_timesteps)) < 1e-5
                     ), f"Scheduler outputs are not identical for prediction_type: {prediction_type}, lower_order_final: {lower_order_final} and final_sigmas_type: {final_sigmas_type}"
+
+    def test_beta_sigmas(self):
+        self.check_over_configs(use_beta_sigmas=True)
+
+    def test_exponential_sigmas(self):
+        self.check_over_configs(use_exponential_sigmas=True)
